@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transcription Temps Réel — Nemotron 3.5 ASR</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0f;
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container { max-width: 900px; width: 100%; padding: 2rem; }
+
+        header {
+            text-align: center;
+            padding: 2rem 0;
+            border-bottom: 1px solid #1a1a2e;
+            margin-bottom: 2rem;
+        }
+
+        h1 {
+            font-size: 2rem;
+            background: linear-gradient(135deg, #00d4ff, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle { color: #666; font-size: 0.9rem; }
+
+        .controls {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+        }
+
+        select, button {
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            border: 1px solid #2a2a3e;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        select { background: #1a1a2e; color: #e0e0e0; }
+        select:hover { border-color: #7c3aed; }
+
+        button {
+            background: linear-gradient(135deg, #1a1a2e, #2a2a3e);
+            color: #e0e0e0;
+            font-weight: 600;
+            min-width: 140px;
+        }
+
+        button:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(124, 58, 237, 0.3); }
+
+        #btnRecord { background: linear-gradient(135deg, #00d4ff, #7c3aed); color: white; }
+        #btnRecord:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+        #btnRecord.recording {
+            background: linear-gradient(135deg, #ff4444, #ff6b6b);
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0.4); }
+            50% { box-shadow: 0 0 0 10px rgba(255, 68, 68, 0); }
+        }
+
+        .visualizer {
+            height: 80px;
+            background: #0f0f1a;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+            overflow: hidden;
+        }
+
+        canvas { width: 100%; height: 100%; display: block; }
+
+        .transcript {
+            background: #0f0f1a;
+            border: 1px solid #1a1a2e;
+            border-radius: 8px;
+            padding: 1.5rem;
+            min-height: 300px;
+            max-height: 60vh;
+            overflow-y: auto;
+            font-size: 1.15rem;
+            line-height: 1.7;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .transcript.empty {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #444;
+            font-style: italic;
+        }
+
+        .cursor {
+            display: inline-block;
+            width: 2px;
+            height: 1.1em;
+            background: #7c3aed;
+            vertical-align: text-bottom;
+            animation: blink 1s steps(2, start) infinite;
+        }
+        @keyframes blink { to { visibility: hidden; } }
+
+        .status {
+            text-align: center;
+            padding: 0.5rem;
+            font-size: 0.85rem;
+            color: #666;
+            margin-bottom: 1rem;
+        }
+
+        .status .dot {
+            display: inline-block;
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #333;
+            margin-right: 0.5rem;
+        }
+
+        .status.active .dot { background: #00ff88; box-shadow: 0 0 8px #00ff88; }
+        .status.error .dot { background: #ff4444; }
+        .status.loading .dot { background: #ffaa00; }
+
+        .stats {
+            display: flex;
+            gap: 2rem;
+            justify-content: center;
+            margin-top: 1.5rem;
+            font-size: 0.85rem;
+            color: #555;
+        }
+
+        .clear-btn {
+            background: transparent;
+            border: 1px solid #333;
+            color: #666;
+            padding: 0.5rem 1rem;
+            font-size: 0.85rem;
+        }
+        .clear-btn:hover { border-color: #ff4444; color: #ff4444; }
+
+        @media (max-width: 600px) {
+            .container { padding: 1rem; }
+            h1 { font-size: 1.5rem; }
+            .controls { flex-direction: column; }
+            select, button { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎙️ Transcription Temps Réel</h1>
+            <p class="subtitle">Nemotron 3.5 ASR Streaming — NVIDIA</p>
+        </header>
+
+        <div class="controls">
+            <select id="language">
+                <option value="auto">🌍 Langue auto</option>
+                <option value="en-US">🇺🇸 English</option>
+                <option value="fr-FR" selected>🇫🇷 Français</option>
+                <option value="de-DE">🇩🇪 Deutsch</option>
+                <option value="es-ES">🇪🇸 Español</option>
+                <option value="it-IT">🇮🇹 Italiano</option>
+                <option value="pt-BR">🇧🇷 Português</option>
+                <option value="zh-CN">🇨🇳 中文</option>
+                <option value="ja-JP">🇯🇵 日本語</option>
+                <option value="ar-AR">🇸🇦 العربية</option>
+                <option value="hi-IN">🇮🇳 हिन्दी</option>
+            </select>
+
+            <select id="latency">
+                <option value="80">⚡ Latence 80 ms</option>
+                <option value="320">🏃 Latence 320 ms</option>
+                <option value="560" selected>⚖️ Latence 560 ms</option>
+                <option value="1120">🎯 Latence 1.1 s</option>
+            </select>
+
+            <button id="btnRecord">🎤 Démarrer</button>
+            <button class="clear-btn" onclick="clearTranscript()">🗑️ Effacer</button>
+        </div>
+
+        <div class="status" id="status">
+            <span class="dot"></span>En attente — cliquez sur Démarrer
+        </div>
+
+        <div class="visualizer">
+            <canvas id="visualizer"></canvas>
+        </div>
+
+        <div class="transcript empty" id="transcript">
+            La transcription apparaîtra ici…
+        </div>
+
+        <div class="stats">
+            <span id="audioSent">Audio envoyé : 0.0 s</span>
+            <span id="status2">—</span>
+        </div>
+    </div>
+
+    <script>
+        const TARGET_RATE = 16000;
+
+        // ── State ────────────────────────────────────────────────
+        let ws = null;
+        let audioContext = null;
+        let analyser = null;
+        let mediaStream = null;
+        let workletNode = null;
+        let gainSink = null;
+        let isRecording = false;
+        let flushTimer = null;
+        let rawAccum = [];        // Float32Array[] from worklet
+        let sentSamples = 0;
+        let currentText = "";
+
+        // ── UI refs ──────────────────────────────────────────────
+        const btnRecord = document.getElementById('btnRecord');
+        const languageSelect = document.getElementById('language');
+        const latencySelect = document.getElementById('latency');
+        const statusEl = document.getElementById('status');
+        const transcriptEl = document.getElementById('transcript');
+        const canvas = document.getElementById('visualizer');
+        const ctx = canvas.getContext('2d');
+        const audioSentEl = document.getElementById('audioSent');
+        const status2El = document.getElementById('status2');
+
+        // ── Canvas sizing ────────────────────────────────────────
+        function resizeCanvas() {
+            canvas.width = canvas.offsetWidth * 2;
+            canvas.height = canvas.offsetHeight * 2;
+        }
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+
+        // ── Visualizer ───────────────────────────────────────────
+        function drawVisualizer() {
+            if (!isRecording) return;
+            requestAnimationFrame(drawVisualizer);
+            if (!analyser) return;
+
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteTimeDomainData(dataArray);
+
+            ctx.fillStyle = '#0f0f1a';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = '#7c3aed';
+            ctx.beginPath();
+
+            const sliceWidth = canvas.width / bufferLength;
+            let x = 0;
+            for (let i = 0; i < bufferLength; i++) {
+                const v = dataArray[i] / 128.0;
+                const y = (v * canvas.height) / 2;
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                x += sliceWidth;
+            }
+            ctx.lineTo(canvas.width, canvas.height / 2);
+            ctx.stroke();
+        }
+
+        // ── AudioWorklet source (inline, loaded from a Blob URL) ─
+        const WORKLET_CODE = `
+            class CaptureProcessor extends AudioWorkletProcessor {
+                process(inputs) {
+                    const input = inputs[0];
+                    if (input && input[0] && input[0].length) {
+                        this.port.postMessage(input[0].slice(0));
+                    }
+                    return true;
+                }
+            }
+            registerProcessor('capture-processor', CaptureProcessor);
+        `;
+
+        // ── Resampler (stateful, linear interpolation → 16 kHz) ──
+        // Keeps a residual buffer so interpolation stays continuous across
+        // the block boundaries (no cumulative sample drift).
+        const resampler = {
+            inRate: TARGET_RATE,
+            outRate: TARGET_RATE,
+            pos: 0,
+            leftover: new Float32Array(0),
+            init(inRate) { this.inRate = inRate; this.pos = 0; this.leftover = new Float32Array(0); },
+            process(block) {
+                if (this.inRate === this.outRate) return block;
+                const ratio = this.inRate / this.outRate;
+                let buf;
+                if (this.leftover.length) {
+                    buf = new Float32Array(this.leftover.length + block.length);
+                    buf.set(this.leftover, 0);
+                    buf.set(block, this.leftover.length);
+                } else {
+                    buf = block;
+                }
+                let p = this.pos;
+                const out = [];
+                while (p + 1 < buf.length) {
+                    const i0 = Math.floor(p);
+                    const frac = p - i0;
+                    out.push(buf[i0] + (buf[i0 + 1] - buf[i0]) * frac);
+                    p += ratio;
+                }
+                const keep = Math.min(Math.floor(p), buf.length);
+                this.leftover = buf.slice(keep);
+                this.pos = p - keep;
+                return Float32Array.from(out);
+            }
+        };
+
+        function floatToInt16(f32) {
+            const out = new Int16Array(f32.length);
+            for (let i = 0; i < f32.length; i++) {
+                const s = Math.max(-1, Math.min(1, f32[i]));
+                out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return out;
+        }
+
+        // ── Audio capture ────────────────────────────────────────
+        async function startCapture() {
+            try {
+                // Use the NATIVE sample rate: getUserMedia delivers at the
+                // hardware rate (usually 48 kHz) and Chrome forbids connecting
+                // a MediaStream to an AudioContext with a different rate.
+                // Resampling to 16 kHz is done in JS (see `resampler`).
+                audioContext = new AudioContext();
+                resampler.init(audioContext.sampleRate);
+                console.log(`AudioContext: native ${audioContext.sampleRate} Hz → ${TARGET_RATE} Hz (JS resample)`);
+
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                // Load the AudioWorklet module from a Blob URL
+                const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+                const url = URL.createObjectURL(blob);
+                await audioContext.audioWorklet.addModule(url);
+                URL.revokeObjectURL(url);
+
+                const source = audioContext.createMediaStreamSource(mediaStream);
+
+                // Analyser for the visualizer (same context → no sample-rate clash)
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 2048;
+                source.connect(analyser);
+
+                // Capture node
+                workletNode = new AudioWorkletNode(audioContext, 'capture-processor');
+                workletNode.port.onmessage = (e) => rawAccum.push(e.data);
+                source.connect(workletNode);
+
+                // Worklet must reach the destination to be pulled; mute it to
+                // avoid feeding the mic back to the speakers.
+                gainSink = audioContext.createGain();
+                gainSink.gain.value = 0;
+                workletNode.connect(gainSink);
+                gainSink.connect(audioContext.destination);
+
+                drawVisualizer();
+                return true;
+            } catch (err) {
+                console.error('Capture error:', err);
+                setStatus('Erreur micro : ' + err.message, 'error');
+                return false;
+            }
+        }
+
+        // ── WebSocket ────────────────────────────────────────────
+        function connectWS() {
+            return new Promise((resolve, reject) => {
+                const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(`${proto}//${location.host}/ws/transcribe`);
+
+                ws.onopen = () => {
+                    ws.send(JSON.stringify({
+                        language: languageSelect.value,
+                        latency_ms: parseInt(latencySelect.value)
+                    }));
+                    resolve();
+                };
+
+                ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    if (typeof data.text === 'string') {
+                        currentText = data.text;
+                        renderTranscript();
+                        status2El.textContent = data.is_final ? 'Session terminée' : 'En cours…';
+                    }
+                };
+
+                ws.onerror = () => setStatus('Erreur WebSocket', 'error');
+                ws.onclose = () => { if (isRecording) setStatus('Connexion fermée', 'error'); };
+                ws._reject = reject;
+            });
+        }
+
+        // ── Chunk flush loop ─────────────────────────────────────
+        function flushAudio() {
+            if (!ws || ws.readyState !== WebSocket.OPEN || rawAccum.length === 0) return;
+
+            // Merge accumulated worklet buffers
+            let total = 0;
+            for (const b of rawAccum) total += b.length;
+            const merged = new Float32Array(total);
+            let off = 0;
+            for (const b of rawAccum) { merged.set(b, off); off += b.length; }
+            rawAccum = [];
+
+            // Resample → int16 → send raw PCM
+            const resampled = resampler.process(merged);
+            if (resampled.length === 0) return;
+            const pcm = floatToInt16(resampled);
+            ws.send(pcm.buffer);
+            sentSamples += pcm.length;
+            audioSentEl.textContent = `Audio envoyé : ${(sentSamples / TARGET_RATE).toFixed(1)} s`;
+        }
+
+        // ── Controls ─────────────────────────────────────────────
+        btnRecord.addEventListener('click', async () => {
+            if (isRecording) stopRecording();
+            else await startRecording();
+        });
+
+        async function startRecording() {
+            const captured = await startCapture();
+            if (!captured) return;
+
+            try {
+                await connectWS();
+            } catch (e) {
+                setStatus('Impossible de se connecter au serveur', 'error');
+                cleanupAudio();
+                return;
+            }
+
+            isRecording = true;
+            btnRecord.textContent = '⏹️ Arrêter';
+            btnRecord.classList.add('recording');
+            setStatus('Transcription en cours…', 'active');
+            status2El.textContent = 'En cours…';
+
+            flushTimer = setInterval(flushAudio, 250);
+        }
+
+        function stopRecording() {
+            isRecording = false;
+            btnRecord.textContent = '🎤 Démarrer';
+            btnRecord.classList.remove('recording');
+            setStatus('Arrêté — cliquez pour redémarrer', '');
+
+            flushAudio();
+
+            if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ command: 'stop' }));
+                setTimeout(() => { if (ws) ws.close(); }, 1500);
+            }
+            cleanupAudio();
+        }
+
+        function cleanupAudio() {
+            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+            if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }
+            if (gainSink) { gainSink.disconnect(); gainSink = null; }
+            if (analyser) { analyser.disconnect(); analyser = null; }
+            if (audioContext) { audioContext.close(); audioContext = null; }
+            rawAccum = [];
+            ws = null;
+        }
+
+        // ── Transcript rendering ─────────────────────────────────
+        function renderTranscript() {
+            transcriptEl.classList.remove('empty');
+            if (!currentText) return;
+            transcriptEl.textContent = currentText;
+            if (isRecording) {
+                const cursor = document.createElement('span');
+                cursor.className = 'cursor';
+                transcriptEl.appendChild(cursor);
+            }
+            transcriptEl.scrollTop = transcriptEl.scrollHeight;
+        }
+
+        function clearTranscript() {
+            currentText = "";
+            sentSamples = 0;
+            audioSentEl.textContent = 'Audio envoyé : 0.0 s';
+            status2El.textContent = '—';
+            transcriptEl.innerHTML = 'La transcription apparaîtra ici…';
+            transcriptEl.classList.add('empty');
+        }
+
+        function setStatus(text, type) {
+            statusEl.className = 'status' + (type ? ` ${type}` : '');
+            statusEl.innerHTML = `<span class="dot"></span>${escapeHtml(text)}`;
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        setStatus('Prêt — cliquez sur Démarrer pour commencer', '');
+    </script>
+</body>
+</html>
