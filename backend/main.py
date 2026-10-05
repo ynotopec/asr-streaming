@@ -1,11 +1,22 @@
 """
 Nemotron 3.5 ASR Streaming Backend
-Real-time cache-aware streaming speech recognition via WebSocket.
+Real-time cache-aware streaming speech recognition via WebSocket, with optional
+speaker diarization (who spoke when) layered on top.
 
-Architecture: one `model.generate()` per WebSocket session, fed by a live
-generator of `input_features` chunks. This preserves the model's streaming
-cache across chunks (the whole point of a cache-aware ASR model) and yields
-coherent, incrementally-growing transcripts.
+Architecture
+------------
+* **ASR**: one `model.generate()` per WebSocket session, fed by a live generator
+  of `input_features` chunks. This preserves the model's streaming cache across
+  chunks (the whole point of a cache-aware ASR model) and yields coherent,
+  incrementally-growing transcripts.
+* **Diarization**: a *separate*, language-agnostic pipeline (Silero VAD →
+  ECAPA-TDNN speaker embeddings → clustering) runs in its own thread on the
+  same audio stream. It produces a speaker timeline that is aligned with the
+  transcript by mapping each newly-emitted character to the audio time that
+  produced it. See `backend/diarization.py`.
+
+The ASR model itself cannot identify speakers — it is a pure transcription
+model. Diarization is therefore an explicit add-on.
 """
 
 # ── Exclude global Hermes venv from sys.path ─────────────────
@@ -18,7 +29,7 @@ import json
 import logging
 import queue
 import threading
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -31,6 +42,8 @@ from transformers import (
     Nemotron3_5AsrForRNNT,
     TextIteratorStreamer,
 )
+
+from backend.diarization import OnlineDiarizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,6 +59,10 @@ SAMPLE_RATE = 16000
 
 # Only one generation runs at a time (single GPU, single demo user).
 GENERATION_LOCK = threading.Lock()
+
+# Latency budget between "audio the model transcribed" and "text arrives".
+# Used to align transcript characters with the diarization timeline.
+ALIGNMENT_SHIFT_S = 1.0
 
 
 async def load_model():
@@ -64,13 +81,10 @@ async def load_model():
 
 
 def _lookahead_for_latency(latency_ms: int) -> int:
-    """Map a requested latency (ms) to the matching num_lookahead_tokens."""
-    mapping = processor.supported_streaming_latencies_ms  # {tokens: ms}
-    # exact match first
+    mapping = processor.supported_streaming_latencies_ms
     for tokens, ms in mapping.items():
         if ms == latency_ms:
             return tokens
-    # fall back to the closest supported latency
     tokens = min(mapping, key=lambda t: abs(mapping[t] - latency_ms))
     logger.warning(f"Latency {latency_ms}ms unsupported, using {mapping[tokens]}ms")
     return tokens
@@ -79,15 +93,37 @@ def _lookahead_for_latency(latency_ms: int) -> int:
 class ASRStreamSession:
     """A single live streaming transcription session (one model.generate call)."""
 
-    def __init__(self, language: str, latency_ms: int, loop: asyncio.AbstractEventLoop):
+    def __init__(
+        self,
+        language: str,
+        latency_ms: int,
+        loop: asyncio.AbstractEventLoop,
+        diarize: bool = False,
+        max_speakers: int = 4,
+    ):
         self.language = language
         self.latency_ms = latency_ms
         self.loop = loop
+        self.diarize = diarize
 
         self.audio_q: "queue.Queue[Optional[np.ndarray]]" = queue.Queue()
-        self.samples = np.zeros(0, dtype=np.float32)   # full session buffer
-        self.text = ""                                  # cumulative transcript
+        self.samples = np.zeros(0, dtype=np.float32)
+        self.text = ""
         self.text_q: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
+
+        # alignment: audio time (s) at which each transcript character appeared
+        self.char_time: List[float] = []
+        self.total_samples = 0            # samples received from the client
+        self._spk_lock = threading.Lock()
+
+        self.diarizer: Optional[OnlineDiarizer] = None
+        if diarize:
+            try:
+                self.diarizer = OnlineDiarizer(max_speakers=max_speakers)
+                self.diarizer.start()
+            except Exception as e:
+                logger.error(f"Diarization init failed, continuing without it: {e}")
+                self.diarizer = None
 
         self._gen_thread: Optional[threading.Thread] = None
         self._read_thread: Optional[threading.Thread] = None
@@ -95,8 +131,12 @@ class ASRStreamSession:
 
     # ── public API (called from the event loop) ──────────────
     def push(self, arr: np.ndarray):
-        if not self._closed:
-            self.audio_q.put(arr)
+        if self._closed:
+            return
+        self.total_samples += int(arr.shape[0])
+        if self.diarizer is not None:
+            self.diarizer.push(arr)
+        self.audio_q.put(arr)
 
     def start(self):
         self._gen_thread = threading.Thread(target=self._run, daemon=True)
@@ -104,11 +144,51 @@ class ASRStreamSession:
 
     def close(self):
         self._closed = True
-        self.audio_q.put(None)  # unblock generator → generate() finishes
+        self.audio_q.put(None)
+
+    def finalize_diarization(self):
+        if self.diarizer is not None:
+            self.diarizer.close()
+            self.diarizer.finalize()
+
+    # ── alignment ────────────────────────────────────────────
+    def note_text(self, new_text: str):
+        """Record the audio time for each newly-appeared character."""
+        n = len(new_text)
+        with self._spk_lock:
+            if n < len(self.char_time):
+                self.char_time = self.char_time[:n]
+            if n > len(self.char_time):
+                t = self.total_samples / SAMPLE_RATE - ALIGNMENT_SHIFT_S
+                t = max(t, 0.0)
+                self.char_time.extend([t] * (n - len(self.char_time)))
+            self.text = new_text
+
+    def speaker_spans(self) -> List[dict]:
+        """Group consecutive characters by speaker → list of spans."""
+        if self.diarizer is None or not self.text:
+            return []
+        with self._spk_lock:
+            per_char = [
+                self.diarizer.speaker_at(t) for t in self.char_time
+            ]
+        spans = []
+        for i, spk in enumerate(per_char):
+            if spk is None:
+                continue
+            if spans and spans[-1]["spk"] == spk and spans[-1]["end"] == i:
+                spans[-1]["end"] = i + 1
+            else:
+                spans.append({"start": i, "end": i + 1, "spk": spk})
+        return spans
+
+    def current_speaker(self) -> Optional[int]:
+        if self.diarizer is None:
+            return None
+        return self.diarizer.current_speaker
 
     # ── worker thread ────────────────────────────────────────
     def _pull_until(self, n: int) -> bool:
-        """Block until the session buffer holds >= n samples. False if closed."""
         while self.samples.shape[0] < n:
             item = self.audio_q.get()
             if item is None:
@@ -142,10 +222,9 @@ class ASRStreamSession:
 
         logger.info(
             f"Session start: lang={self.language}, latency={processor.streaming_latency_ms}ms, "
-            f"first={first_need} samples, per={per_need} samples"
+            f"first={first_need} samples, per={per_need} samples, diarize={self.diarize}"
         )
 
-        # ── wait for the first chunk, build the "first_chunk_inputs" ──
         if not self._pull_until(first_need):
             self.loop.call_soon_threadsafe(self.text_q.put_nowait, None)
             return
@@ -159,7 +238,6 @@ class ASRStreamSession:
             return_tensors="pt",
         ).to(model.device, dtype=model.dtype)
 
-        # ── generator yielding input_features chunk after chunk ──
         def input_features_generator():
             yield first_inputs.input_features[:, :first_mel, :]
             mel_idx = first_mel
@@ -187,8 +265,8 @@ class ASRStreamSession:
             last_sent = ""
             try:
                 for chunk in streamer:
-                    self.text += chunk
-                    if self.text != last_sent:      # dedupe: skip identical frames
+                    self.note_text(self.text + chunk)
+                    if self.text != last_sent:
                         last_sent = self.text
                         self.loop.call_soon_threadsafe(self.text_q.put_nowait, self.text)
             except Exception as e:
@@ -219,7 +297,7 @@ class ASRStreamSession:
 
 
 # ── FastAPI app ───────────────────────────────────────────────
-app = FastAPI(title="Nemotron 3.5 ASR Streaming", version="2.0.0")
+app = FastAPI(title="Nemotron 3.5 ASR Streaming", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -249,9 +327,20 @@ async def health():
         "model": MODEL_ID,
         "device": device,
         "dtype": str(dtype),
+        "diarization": "ECAPA-TDNN (speechbrain) + Silero VAD, CPU",
         "supported_latencies_ms": sorted(processor.supported_streaming_latencies_ms.values())
         if processor
         else [],
+    }
+
+
+def _payload(session: ASRStreamSession, is_final: bool) -> dict:
+    return {
+        "text": session.text,
+        "spans": session.speaker_spans(),
+        "current_speaker": session.current_speaker(),
+        "diarization": session.diarizer is not None,
+        "is_final": is_final,
     }
 
 
@@ -259,9 +348,10 @@ async def health():
 async def ws_transcribe(ws: WebSocket):
     """
     Protocol:
-      1. text JSON config: {"language": "fr-FR", "latency_ms": 560}
+      1. text JSON config: {"language": "fr-FR", "latency_ms": 560,
+                            "diarize": true, "max_speakers": 4}
       2. binary frames: raw little-endian int16 mono PCM @ 16 kHz
-      → text JSON back: {"text": "<cumulative transcript>", "is_final": false|true}
+      → text JSON back: {"text", "spans", "current_speaker", "is_final"}
     """
     await ws.accept()
     logger.info("Client connected")
@@ -275,9 +365,10 @@ async def ws_transcribe(ws: WebSocket):
         while True:
             item = await session.text_q.get()
             if item is None:
-                await ws.send_json({"text": session.text, "is_final": True})
+                session.finalize_diarization()
+                await ws.send_json(_payload(session, is_final=True))
                 break
-            await ws.send_json({"text": item, "is_final": False})
+            await ws.send_json(_payload(session, is_final=False))
 
     try:
         while True:
@@ -296,15 +387,23 @@ async def ws_transcribe(ws: WebSocket):
                     continue
                 if cfg.get("command") == "stop":
                     if session is not None:
-                        session.close()  # flush tail + emit is_final
+                        session.close()
                     continue
-                language = cfg.get("language", "auto")
-                latency_ms = int(cfg.get("latency_ms", 560))
                 if session is None:
-                    session = ASRStreamSession(language, latency_ms, loop)
+                    language = cfg.get("language", "auto")
+                    latency_ms = int(cfg.get("latency_ms", 560))
+                    diarize = bool(cfg.get("diarize", False))
+                    max_speakers = int(cfg.get("max_speakers", 4))
+                    session = ASRStreamSession(
+                        language, latency_ms, loop,
+                        diarize=diarize, max_speakers=max_speakers,
+                    )
                     forward_task = asyncio.create_task(forward())
                     session.start()
-                    logger.info(f"Config: language={language}, latency={latency_ms}ms")
+                    logger.info(
+                        f"Config: language={language}, latency={latency_ms}ms, "
+                        f"diarize={diarize}, max_speakers={max_speakers}"
+                    )
                 continue
 
             if "bytes" in msg and msg["bytes"]:
@@ -324,7 +423,7 @@ async def ws_transcribe(ws: WebSocket):
             session.close()
         if forward_task is not None:
             try:
-                await asyncio.wait_for(forward_task, timeout=5)
+                await asyncio.wait_for(forward_task, timeout=10)
             except Exception:
                 forward_task.cancel()
 

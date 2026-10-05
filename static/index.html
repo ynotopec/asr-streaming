@@ -121,6 +121,40 @@
         }
         @keyframes blink { to { visibility: hidden; } }
 
+        /* speaker labels */
+        .spk {
+            display: inline-block;
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 0.05rem 0.45rem;
+            border-radius: 999px;
+            margin-right: 0.35rem;
+            vertical-align: middle;
+            letter-spacing: 0.02em;
+            border: 1px solid currentColor;
+        }
+        .spk0 { color: #00d4ff; }
+        .spk1 { color: #7c3aed; }
+        .spk2 { color: #00ff88; }
+        .spk3 { color: #ffaa00; }
+        .spk4 { color: #ff6b6b; }
+        .spk5 { color: #e879f9; }
+
+        .toggle {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: #1a1a2e;
+            border: 1px solid #2a2a3e;
+            border-radius: 8px;
+            padding: 0.6rem 1rem;
+            cursor: pointer;
+            user-select: none;
+            font-size: 0.95rem;
+        }
+        .toggle:hover { border-color: #7c3aed; }
+        .toggle input { width: 16px; height: 16px; accent-color: #7c3aed; cursor: pointer; }
+
         .status {
             text-align: center;
             padding: 0.5rem;
@@ -197,6 +231,14 @@
             </select>
 
             <button id="btnRecord">🎤 Démarrer</button>
+            <label class="toggle" title="Identifier les locuteurs (ECAPA-TDNN + VAD)">
+                <input type="checkbox" id="diarize" checked> 👥 Locuteurs
+            </label>
+            <select id="maxSpeakers" title="Nombre maximum de locuteurs">
+                <option value="2">👥 max 2</option>
+                <option value="3">👥 max 3</option>
+                <option value="4" selected>👥 max 4</option>
+            </select>
             <button class="clear-btn" onclick="clearTranscript()">🗑️ Effacer</button>
         </div>
 
@@ -214,6 +256,7 @@
 
         <div class="stats">
             <span id="audioSent">Audio envoyé : 0.0 s</span>
+            <span id="currentSpk"></span>
             <span id="status2">—</span>
         </div>
     </div>
@@ -233,11 +276,15 @@
         let rawAccum = [];        // Float32Array[] from worklet
         let sentSamples = 0;
         let currentText = "";
+        let currentSpans = [];
+        let currentSpeaker = null;
 
         // ── UI refs ──────────────────────────────────────────────
         const btnRecord = document.getElementById('btnRecord');
         const languageSelect = document.getElementById('language');
         const latencySelect = document.getElementById('latency');
+        const diarizeCheck = document.getElementById('diarize');
+        const maxSpeakersSelect = document.getElementById('maxSpeakers');
         const statusEl = document.getElementById('status');
         const transcriptEl = document.getElementById('transcript');
         const canvas = document.getElementById('visualizer');
@@ -403,7 +450,9 @@
                 ws.onopen = () => {
                     ws.send(JSON.stringify({
                         language: languageSelect.value,
-                        latency_ms: parseInt(latencySelect.value)
+                        latency_ms: parseInt(latencySelect.value),
+                        diarize: diarizeCheck.checked,
+                        max_speakers: parseInt(maxSpeakersSelect.value)
                     }));
                     resolve();
                 };
@@ -412,7 +461,10 @@
                     const data = JSON.parse(event.data);
                     if (typeof data.text === 'string') {
                         currentText = data.text;
+                        currentSpans = data.spans || [];
+                        currentSpeaker = data.current_speaker;
                         renderTranscript();
+                        updateSpeakerBadge();
                         status2El.textContent = data.is_final ? 'Session terminée' : 'En cours…';
                     }
                 };
@@ -501,7 +553,27 @@
         function renderTranscript() {
             transcriptEl.classList.remove('empty');
             if (!currentText) return;
-            transcriptEl.textContent = currentText;
+
+            if (currentSpans && currentSpans.length) {
+                // Speaker-labelled rendering: a chip each time the speaker changes.
+                let html = '';
+                let lastSpk = null;
+                for (const s of currentSpans) {
+                    if (s.spk !== lastSpk) {
+                        html += `<span class="spk spk${s.spk % 6}">Locuteur ${s.spk + 1}</span>`;
+                        lastSpk = s.spk;
+                    }
+                    html += escapeHtml(currentText.slice(s.start, s.end));
+                }
+                const lastEnd = currentSpans[currentSpans.length - 1].end;
+                if (lastEnd < currentText.length) {
+                    html += escapeHtml(currentText.slice(lastEnd));
+                }
+                transcriptEl.innerHTML = html;
+            } else {
+                transcriptEl.textContent = currentText;
+            }
+
             if (isRecording) {
                 const cursor = document.createElement('span');
                 cursor.className = 'cursor';
@@ -510,11 +582,24 @@
             transcriptEl.scrollTop = transcriptEl.scrollHeight;
         }
 
+        function updateSpeakerBadge() {
+            if (currentSpeaker === null || currentSpeaker === undefined || !isRecording) {
+                return;
+            }
+            const el = document.getElementById('currentSpk');
+            if (el) {
+                el.innerHTML = `<span class="spk spk${currentSpeaker % 6}">🎙️ Locuteur ${currentSpeaker + 1}</span>`;
+            }
+        }
+
         function clearTranscript() {
             currentText = "";
+            currentSpans = [];
+            currentSpeaker = null;
             sentSamples = 0;
             audioSentEl.textContent = 'Audio envoyé : 0.0 s';
             status2El.textContent = '—';
+            document.getElementById('currentSpk').innerHTML = '';
             transcriptEl.innerHTML = 'La transcription apparaîtra ici…';
             transcriptEl.classList.add('empty');
         }
