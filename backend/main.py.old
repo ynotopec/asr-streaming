@@ -1,0 +1,289 @@
+"""
+Audio-to-Audio Translator — Full Pipeline
+ASR (Nemotron 3.5 Streaming via nemo_toolkit) → Text Translation (MarianMT) → TTS (Qwen3-TTS via qwen-tts)
+"""
+
+import sys
+sys.path = [p for p in sys.path if not p.startswith("/home/ai-agent/.hermes/installs")]
+
+import asyncio
+import json
+import logging
+import threading
+import tempfile
+import os
+import io
+from typing import Optional
+
+import numpy as np
+import torch
+import soundfile as sf
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, Response
+
+# ── Nemotron ASR via nemo_toolkit ──────────────────
+from nemo.collections.asr.models import EncDecRNNTBPEModel
+
+from translation import translate_text, init_translation, SUPPORTED_LANGS
+from tts_engine import (
+    load_model as load_tts_model,
+    synthesize as synthesize_audio,
+    model as tts_model,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# ── Globals ─────────────────────────────────────────
+asr_model = None
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.float16 if device == "cuda" else torch.float32
+
+ASR_MODEL_ID = "nvidia/nemotron-3.5-asr-streaming-0.6b"
+SAMPLE_RATE = 16000
+
+LOCALE_TO_MARIAN = {
+    "en-US": "en", "en-GB": "en", "en": "en",
+    "fr-FR": "fr", "fr-CA": "fr", "fr": "fr",
+    "de-DE": "de", "de": "de",
+    "es-ES": "es", "es-US": "es", "es": "es",
+    "it-IT": "it", "it": "it",
+    "pt-BR": "pt", "pt-PT": "pt", "pt": "pt",
+    "zh-CN": "zh", "zh-TW": "zh", "zh": "zh",
+    "ja-JP": "ja", "ja": "ja",
+    "ko-KR": "ko", "ko": "ko",
+    "ru-RU": "ru", "ru": "ru",
+    "ar": "ar", "hi-IN": "hi", "hi": "hi",
+}
+
+# ── FastAPI app ─────────────────────────────────────
+app = FastAPI(title="Audio2Audio Translator", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+def float_to_int16(f32: np.ndarray) -> np.ndarray:
+    s = np.clip(f32, -1.0, 1.0)
+    return (s * 32767).astype(np.int16)
+
+
+def audio_to_wav_bytes(audio: np.ndarray, sr: int) -> bytes:
+    buf = io.BytesIO()
+    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def get_marian_lang(locale_id: str) -> str:
+    if locale_id in LOCALE_TO_MARIAN:
+        return LOCALE_TO_MARIAN[locale_id]
+    prefix = locale_id.split("-")[0] if "-" in locale_id else locale_id
+    return LOCALE_TO_MARIAN.get(prefix, "en")
+
+
+# ── Batch API ───────────────────────────────────────
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "asr_model": ASR_MODEL_ID,
+        "tts_model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "device": device,
+        "supported_languages": list(SUPPORTED_LANGS.keys()),
+    }
+
+
+@app.post("/api/translate")
+async def translate_file(
+    file: UploadFile = File(...),
+    src_lang: str = "auto",
+    tgt_lang: str = "fr-FR",
+):
+    """Batch: upload audio → translated WAV."""
+    content = await file.read()
+
+    with tempfile.NamedTemporaryFile(
+        suffix=os.path.splitext(file.filename)[1] or ".wav", delete=False
+    ) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        import torchaudio
+
+        audio_tensor, sr = torchaudio.load(tmp_path)
+        if audio_tensor.shape[0] > 1:
+            audio_tensor = audio_tensor.mean(dim=0, keepdim=True)
+        if sr != SAMPLE_RATE:
+            audio_tensor = torchaudio.functional.resample(audio_tensor, sr, SAMPLE_RATE)
+        audio_np = audio_tensor.squeeze().numpy()
+
+        # ASR with Nemotron
+        logger.info(f"ASR: {src_lang} → translate → {tgt_lang}")
+        with torch.no_grad():
+            transcription = asr_model.transcribe([audio_np])
+        text = transcription[0] if transcription else ""
+        logger.info(f"Transcript: {text}")
+
+        # Translate
+        if src_lang == "auto":
+            translated = translate_text(text, "en-US", tgt_lang)
+        else:
+            translated = translate_text(text, src_lang, tgt_lang)
+        logger.info(f"Translated: {translated}")
+
+        # TTS
+        if tts_model is not None:
+            wavs, tts_sr = await synthesize_audio(translated, tgt_lang)
+            wav_bytes = audio_to_wav_bytes(wavs, tts_sr)
+        else:
+            wav_bytes = b"Error: TTS model not loaded"
+
+        return Response(content=wav_bytes, media_type="audio/wav")
+
+    except Exception as e:
+        import traceback
+        logger.error(f"Batch translate error: {e}\n{traceback.format_exc()}")
+        return Response(content=f"Error: {str(e)}", status_code=500)
+    finally:
+        os.unlink(tmp_path)
+
+
+# ── Streaming WebSocket ──────────────────────────────
+@app.websocket("/ws/translate")
+async def ws_translate(ws: WebSocket):
+    await ws.accept()
+    logger.info("Client connected to translation WS")
+
+    config = {"src_lang": "auto", "tgt_lang": "fr-FR"}
+    audio_chunks: list[np.ndarray] = []
+    buffer_lock = threading.Lock()
+    transcript = ""
+    text_events: list[dict] = []
+    event_lock = threading.Lock()
+    stop_event = threading.Event()
+
+    def _asr_thread():
+        flush_interval = int(SAMPLE_RATE * 3)
+        try:
+            while not stop_event.is_set():
+                with buffer_lock:
+                    total = sum(c.shape[0] for c in audio_chunks)
+                if total >= flush_interval and audio_chunks:
+                    with buffer_lock:
+                        full = np.concatenate(audio_chunks)
+                        audio_chunks.clear()
+                    with torch.no_grad():
+                        transcription = asr_model.transcribe([full])
+                    text = transcription[0] if transcription else ""
+                    if text:
+                        transcript = text
+                        with event_lock:
+                            text_events.append({"type": "transcript", "text": text})
+                stop_event.wait(0.2)
+
+            # Final flush
+            with buffer_lock:
+                total = sum(c.shape[0] for c in audio_chunks)
+            if total > 0 and audio_chunks:
+                with buffer_lock:
+                    full = np.concatenate(audio_chunks)
+                    audio_chunks.clear()
+                with torch.no_grad():
+                    transcription = asr_model.transcribe([full])
+                text = transcription[0] if transcription else ""
+                if text:
+                    transcript = text
+                    with event_lock:
+                        text_events.append({"type": "transcript", "text": text})
+        except Exception as e:
+            logger.error(f"ASR thread error: {e}")
+
+    asr_thread = threading.Thread(target=_asr_thread, daemon=True)
+    asr_thread.start()
+
+    try:
+        while True:
+            msg = await ws.receive()
+
+            if msg["type"] == "websocket.disconnect":
+                logger.info("Client disconnected")
+                break
+            if msg["type"] != "websocket.receive":
+                continue
+
+            if "text" in msg and msg["text"] is not None:
+                try:
+                    cfg = json.loads(msg["text"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+                if cfg.get("command") == "stop":
+                    stop_event.set()
+                    break
+
+                if "src_lang" in cfg:
+                    config["src_lang"] = cfg["src_lang"]
+                if "tgt_lang" in cfg:
+                    config["tgt_lang"] = cfg["tgt_lang"]
+                continue
+
+            if "bytes" in msg and msg["bytes"]:
+                with buffer_lock:
+                    arr = np.frombuffer(msg["bytes"], dtype=np.int16).astype(np.float32) / 32767.0
+                    audio_chunks.append(arr)
+                continue
+
+    except WebSocketDisconnect:
+        logger.info("Client disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        stop_event.set()
+        with event_lock:
+            remaining = list(text_events)
+            text_events.clear()
+
+        for evt in remaining:
+            if evt.get("text") and evt.get("type") == "transcript":
+                await ws.send_json(evt)
+                translated = translate_text(evt["text"], config["src_lang"], config["tgt_lang"])
+                await ws.send_json({"type": "translated", "text": translated})
+                if tts_model is not None:
+                    try:
+                        wavs, sr = await synthesize_audio(translated, config["tgt_lang"])
+                        wav_bytes = audio_to_wav_bytes(wavs, sr)
+                        await ws.send_bytes(wav_bytes)
+                    except Exception as e:
+                        logger.error(f"TTS error: {e}")
+
+
+# ── Startup ──────────────────────────────────────────
+@app.on_event("startup")
+async def startup():
+    global asr_model
+
+    logger.info(f"Loading {ASR_MODEL_ID} on {device}…")
+    asr_model = EncDecRNNTBPEModel.from_pretrained(ASR_MODEL_ID)
+    asr_model.eval()
+    if device == "cuda":
+        asr_model = asr_model.to("cuda")
+    logger.info(f"Nemotron ASR loaded ✓ on {device}")
+
+    init_translation()
+    await load_tts_model()
