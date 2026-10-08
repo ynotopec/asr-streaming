@@ -20,6 +20,13 @@ translate(language1, language2)
 Streaming WebSocket endpoint: real-time audio-in → audio-out.
 Batch REST endpoint: upload audio file → receive translated audio.
 
+## Streaming ASR (backend/streaming_asr.py)
+
+- Cache-aware encoder: one encoder cache per utterance, fed contiguous feature chunks via `conformer_stream_step` (chunk/pre-encode/shift from `encoder.streaming_cfg`).
+- Partial hypotheses pushed live; an utterance closes only after ≥0.6 s of silence (or 10 s max), then is translated and voiced.
+- Do not transcribe isolated segments with `model.transcribe()` for the live path: it discards encoder context and degrades the output.
+- Translation pairs must exist on HuggingFace. Verified: `opus-mt-ROMANCE-en` (pt→en), `opus-mt-tc-big-en-pt`, `opus-mt-en-fr`, `opus-mt-en-jap`, `opus-mt-tc-big-en-ko`, `opus-mt-tc-big-en-tr`. Absent pairs fall back to the English pivot.
+
 ## Languages
 
 ASR supports 40 locales (transcription-ready, broad-coverage, adaptation-ready).

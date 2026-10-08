@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse, Response
 
 import tts_engine as _tts_engine
 from translation import translate_text, init_translation, SUPPORTED_LANGS
+from streaming_asr import UtteranceStreamer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -202,73 +203,44 @@ async def ws_translate(ws: WebSocket):
         translated = translate_text(text, effective_src, config["tgt_lang"])
         await ws.send_json({"type": "transcript", "text": text})
         await ws.send_json({"type": "translated", "text": translated})
-        # Skip TTS for fragments (<4 words): no useful speech, avoids silence gaps
-        if len(text.split()) < 4:
-            logger.info(f"TTS skipped (fragment, {len(text.split())} words): {text!r}")
-            return
         if _tts_engine.model is not None:
             wavs, sr = await _tts_engine.synthesize(translated, config["tgt_lang"])
             wav_bytes = audio_to_wav_bytes(trim_silence(np.asarray(wavs, dtype=np.float32), sr), sr)
             await ws.send_bytes(wav_bytes)
 
+    async def _send_partial(text: str):
+        await ws.send_json({"type": "transcript", "text": text})
+
     def _asr_thread():
         """
-        Pause-based segmentation: accumulate mic audio, cut at natural
-        pauses (>=300ms below energy floor) or hard limit 3s. Segments
-        align on word boundaries — no mid-syllable cuts, no silence ASR.
+        Cache-aware streaming ASR (nemotron-3.5-asr-streaming). One encoder cache
+        per utterance; partial hypotheses are pushed live; an utterance is closed
+        only on a real pause (see backend/streaming_asr.py), then translated + voiced.
         """
-        frame = SAMPLE_RATE // 10          # 100ms analysis frame
-        pause_frames = 3                   # 300ms of low energy = pause
-        max_seg = SAMPLE_RATE * 3
-        min_seg = int(SAMPLE_RATE * 0.8)
-        energy_floor = 3e-4                # RMS below this = silence
+        if nemo_model is None:
+            return
+        streamer = UtteranceStreamer(nemo_model)
 
-        buf = np.zeros(0, dtype=np.float32)
-        low_energy_run = 0
+        def _emit(events):
+            for kind, raw in events:
+                clean, detected = parse_transcript(raw)
+                if not clean:
+                    continue
+                if kind == "partial":
+                    asyncio.run_coroutine_threadsafe(_send_partial(clean), loop)
+                else:
+                    asyncio.run_coroutine_threadsafe(_flush_and_respond(clean, detected), loop)
+
         try:
             while not stop_event.is_set():
                 with buffer_lock:
-                    if audio_chunks:
-                        buf = np.concatenate([buf] + audio_chunks)
-                        audio_chunks.clear()
-
-                do_flush = False
-                if len(buf) >= frame:
-                    # analyze last frame energy
-                    last = buf[-frame:]
-                    rms = float(np.sqrt((last ** 2).mean()))
-                    if rms < energy_floor:
-                        low_energy_run += 1
-                        if low_energy_run >= pause_frames and len(buf) >= min_seg:
-                            do_flush = True   # flush everything incl. trailing pause
-                    else:
-                        low_energy_run = 0
-                    if len(buf) >= max_seg:
-                        do_flush = True
-
-                if do_flush and len(buf) > 0:
-                    # trim leading/trailing silence off the segment
-                    frame_rms = np.sqrt(np.convolve(buf ** 2, np.ones(frame)/frame, mode="same"))
-                    voiced = np.where(frame_rms > energy_floor)[0]
-                    if len(voiced) == 0:
-                        buf = np.zeros(0, dtype=np.float32)
-                        low_energy_run = 0
-                        continue
-                    seg = buf[max(0, voiced[0] - frame): min(len(buf), voiced[-1] + 2 * frame)]
-                    buf = np.zeros(0, dtype=np.float32)
-                    low_energy_run = 0
-                    text, detected = transcribe_nemotron(seg)
-                    if text:
-                        asyncio.run_coroutine_threadsafe(
-                            _flush_and_respond(text, detected), loop
-                        )
-                stop_event.wait(0.1)
-
-            # Final flush
-            if len(buf) > 0:
-                text, detected = transcribe_nemotron(buf)
-                if text:
-                    asyncio.run_coroutine_threadsafe(_flush_and_respond(text, detected), loop)
+                    new = np.concatenate(audio_chunks) if audio_chunks else None
+                    audio_chunks.clear()
+                if new is None:
+                    stop_event.wait(0.02)
+                    continue
+                _emit(streamer.push(new))
+            _emit(streamer._finalize())  # close the open utterance on stop
         except Exception as e:
             logger.error(f"ASR thread error: {e}")
 
